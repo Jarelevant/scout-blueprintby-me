@@ -1,0 +1,6 @@
+{
+  "name": "Blueprint Prospect AI",
+  "description": "Internal B2B prospect discovery and website intelligence platform developed by Blueprintby.me.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
