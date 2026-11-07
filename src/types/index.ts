@@ -101,6 +101,12 @@ export interface DiscoveryResult {
   fundingStage?: FundingStage;
   techStack?: string[];
   hiringRolesCount?: number;
+  // Contact data found while scraping (real backend); absent when not found.
+  publicEmail?: string;
+  phone?: string;
+  linkedinUrl?: string;
+  contactPageUrl?: string;
+  careersPageUrl?: string;
 }
 
 export interface DiscoveryJob {

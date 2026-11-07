@@ -5,9 +5,11 @@ import {
   CheckCircle2,
   Clock,
   Layers,
+  LogOut,
   Search as SearchIcon,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { apiClient } from '../../api/client';
 
 export const Header: React.FC = () => {
   const { currentTab, setMobileNavOpen, activities, isOnline, lastSyncTime, setCurrentTab } = useApp();
@@ -97,6 +99,19 @@ export const Header: React.FC = () => {
             />
             <span className="font-mono text-[11px] tabular-nums">Sync: {lastSyncTime}</span>
           </div>
+
+          {/* Sign out (real backend only) */}
+          {apiClient.remote && (
+            <button
+              type="button"
+              onClick={() => apiClient.logout()}
+              className="p-2 rounded-lg text-[#70757D] hover:text-[#202124] hover:bg-[#F8F9FA] border border-[#E9EAEC] transition-colors"
+              aria-label="Sign out"
+              title="Sign out"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
+          )}
 
           {/* Notifications Flyout Button */}
           <div className="relative">

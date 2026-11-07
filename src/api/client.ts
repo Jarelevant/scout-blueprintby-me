@@ -1,9 +1,11 @@
 /**
  * Centralized API Client & Service Adapter for Scout
- * 
- * Supports both real FastAPI backend calls (when connected) and realistic
- * local mock simulations with persistent localStorage caching.
- * Ready for drop-in FastAPI backend integration.
+ *
+ * Two modes, chosen at build time:
+ * - Remote: VITE_API_BASE_URL is set (e.g. https://api.blueprintby.me/scout/v1). Calls the
+ *   shared FastAPI backend with a user JWT; async jobs (discovery, scraping) are polled here so
+ *   callers still get a finished result.
+ * - Mock: no VITE_API_BASE_URL. Realistic local simulation persisted in localStorage.
  */
 
 import {
@@ -28,6 +30,31 @@ const STORAGE_KEY_PROSPECTS = 'blueprint_prospects_v1';
 const STORAGE_KEY_JOBS = 'blueprint_jobs_v1';
 const STORAGE_KEY_SETTINGS = 'blueprint_settings_v1';
 const STORAGE_KEY_ACTIVITIES = 'blueprint_activities_v1';
+const STORAGE_KEY_AUTH = 'blueprint_auth_v1';
+
+/** Fired on window when the backend needs (re-)authentication. */
+export const AUTH_REQUIRED_EVENT = 'scout:auth-required';
+
+const POLL_INTERVAL_MS = 1500;
+const POLL_TIMEOUT_MS = 5 * 60 * 1000;
+
+interface AuthTokens {
+  accessToken: string;
+  refreshToken: string;
+}
+
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+
+  constructor(status: number, message: string, code?: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export interface SearchProspectsRequest {
   keyword: string;
@@ -64,10 +91,126 @@ export interface ApiHealthResponse {
 
 class ApiClient {
   private baseUrl: string;
-  private useMockFallback: boolean = true;
+  /** True when built against a real backend (VITE_API_BASE_URL set). */
+  public readonly remote: boolean;
+  private tokens: AuthTokens | null;
 
   constructor() {
-    this.baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
+    const envUrl = import.meta.env.VITE_API_BASE_URL as string | undefined;
+    this.remote = Boolean(envUrl);
+    this.baseUrl = envUrl || 'http://localhost:8000/api/v1';
+    this.tokens = this.loadTokens();
+  }
+
+  // --- Auth (remote mode) ---
+  // Tokens live in localStorage: acceptable for this internal tool, but any XSS can read them.
+
+  public isAuthenticated(): boolean {
+    return !this.remote || this.tokens !== null;
+  }
+
+  async login(email: string, password: string): Promise<void> {
+    const res = await fetch(`${this.platformBase()}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    if (!res.ok) throw await this.toError(res);
+    const data = await res.json();
+    this.setTokens({ accessToken: data.accessToken, refreshToken: data.refreshToken });
+  }
+
+  logout() {
+    this.setTokens(null);
+    window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
+  }
+
+  private platformBase(): string {
+    return `${new URL(this.baseUrl).origin}/v1`;
+  }
+
+  private loadTokens(): AuthTokens | null {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_AUTH);
+      return raw ? (JSON.parse(raw) as AuthTokens) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private setTokens(tokens: AuthTokens | null) {
+    this.tokens = tokens;
+    try {
+      if (tokens) localStorage.setItem(STORAGE_KEY_AUTH, JSON.stringify(tokens));
+      else localStorage.removeItem(STORAGE_KEY_AUTH);
+    } catch {
+      // Storage unavailable: tokens stay in memory for this tab.
+    }
+  }
+
+  private async refreshTokens(): Promise<boolean> {
+    if (!this.tokens) return false;
+    try {
+      const res = await fetch(`${this.platformBase()}/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken: this.tokens.refreshToken }),
+      });
+      if (!res.ok) return false;
+      const data = await res.json();
+      this.setTokens({ accessToken: data.accessToken, refreshToken: data.refreshToken });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async toError(res: Response): Promise<ApiError> {
+    try {
+      const body = await res.json();
+      return new ApiError(res.status, body?.error?.message ?? res.statusText, body?.error?.code);
+    } catch {
+      return new ApiError(res.status, res.statusText);
+    }
+  }
+
+  private async request<T>(method: string, path: string, body?: unknown, retry = true): Promise<T> {
+    const headers: Record<string, string> = {};
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    if (this.tokens) headers.Authorization = `Bearer ${this.tokens.accessToken}`;
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 401) {
+      if (retry && (await this.refreshTokens())) return this.request<T>(method, path, body, false);
+      this.setTokens(null);
+      window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
+    }
+    if (!res.ok) throw await this.toError(res);
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
+  }
+
+  /** Re-fetch until `done` holds; the backend runs discovery/scraping on a worker. */
+  private async poll<T>(fetchOnce: () => Promise<T>, done: (value: T) => boolean): Promise<T> {
+    const deadline = Date.now() + POLL_TIMEOUT_MS;
+    for (;;) {
+      const value = await fetchOnce();
+      if (done(value)) return value;
+      if (Date.now() > deadline) throw new ApiError(408, 'Timed out waiting for the job to finish');
+      await sleep(POLL_INTERVAL_MS);
+    }
+  }
+
+  private async getOrNull<T>(path: string): Promise<T | null> {
+    try {
+      return await this.request<T>('GET', path);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
+    }
   }
 
   public getBaseUrl(): string {
@@ -157,6 +300,7 @@ class ApiClient {
    * GET /api/v1/dashboard/stats
    */
   async getDashboardStats(): Promise<DashboardStats> {
+    if (this.remote) return this.request('GET', '/dashboard/stats');
     const prospects = this.loadStoredProspects();
     return calculateDashboardStats(prospects);
   }
@@ -165,6 +309,7 @@ class ApiClient {
    * GET /api/v1/prospects
    */
   async getProspects(): Promise<Prospect[]> {
+    if (this.remote) return this.request('GET', '/prospects');
     return this.loadStoredProspects();
   }
 
@@ -172,6 +317,7 @@ class ApiClient {
    * GET /api/v1/prospects/{id}
    */
   async getProspectById(id: string): Promise<Prospect | null> {
+    if (this.remote) return this.getOrNull(`/prospects/${encodeURIComponent(id)}`);
     const list = this.loadStoredProspects();
     return list.find((p) => p.id === id) || null;
   }
@@ -180,6 +326,10 @@ class ApiClient {
    * DELETE /api/v1/prospects/{id}
    */
   async deleteProspect(id: string): Promise<boolean> {
+    if (this.remote) {
+      await this.request('DELETE', `/prospects/${encodeURIComponent(id)}`);
+      return true;
+    }
     const list = this.loadStoredProspects();
     const updated = list.filter((p) => p.id !== id);
     this.saveStoredProspects(updated);
@@ -190,6 +340,10 @@ class ApiClient {
    * Batch DELETE prospects
    */
   async deleteMultipleProspects(ids: string[]): Promise<boolean> {
+    if (this.remote) {
+      await this.request('POST', '/prospects/batch-delete', { ids });
+      return true;
+    }
     const set = new Set(ids);
     const list = this.loadStoredProspects();
     const updated = list.filter((p) => !set.has(p.id));
@@ -201,6 +355,7 @@ class ApiClient {
    * POST /api/v1/prospects (Save new or updated prospect)
    */
   async saveProspect(prospect: Prospect): Promise<Prospect> {
+    if (this.remote) return this.request('POST', '/prospects', prospect);
     const list = this.loadStoredProspects();
     const existingIndex = list.findIndex((p) => p.id === prospect.id);
     let updated: Prospect[];
@@ -231,6 +386,9 @@ class ApiClient {
    * PATCH /api/v1/prospects/:id/qualification
    */
   async updateProspectQualification(id: string, qualificationStatus: QualificationStatus): Promise<Prospect> {
+    if (this.remote) {
+      return this.request('PATCH', `/prospects/${encodeURIComponent(id)}/qualification`, { qualificationStatus });
+    }
     const list = this.loadStoredProspects();
     const existing = list.find((p) => p.id === id);
     if (!existing) {
@@ -248,6 +406,9 @@ class ApiClient {
    * PATCH /api/v1/prospects/:id/notes-tags
    */
   async updateProspectNotesAndTags(id: string, analystNotes: string, tags: string[]): Promise<Prospect> {
+    if (this.remote) {
+      return this.request('PATCH', `/prospects/${encodeURIComponent(id)}/notes-tags`, { analystNotes, tags });
+    }
     const list = this.loadStoredProspects();
     const existing = list.find((p) => p.id === id);
     if (!existing) {
@@ -269,6 +430,21 @@ class ApiClient {
     job: DiscoveryJob;
     generatedResults: DiscoveryResult[];
   }> {
+    if (this.remote) {
+      const { jobId } = await this.request<SearchProspectsResponse>('POST', '/discovery/search', req);
+      const job = await this.poll(
+        async () => {
+          const j = await this.getJobById(jobId);
+          if (!j) throw new ApiError(404, `Job ${jobId} disappeared`);
+          return j;
+        },
+        (j) => j.status === 'completed' || j.status === 'failed'
+      );
+      if (job.status === 'failed') {
+        throw new ApiError(500, (job as DiscoveryJob & { error?: string }).error || 'Discovery failed');
+      }
+      return { job, generatedResults: job.results ?? [] };
+    }
     const jobId = `job-${Date.now().toString().slice(-4)}`;
     const nowIso = new Date().toISOString();
 
@@ -316,6 +492,7 @@ class ApiClient {
    * GET /api/v1/jobs
    */
   async getJobs(): Promise<DiscoveryJob[]> {
+    if (this.remote) return this.request('GET', '/jobs');
     return this.loadStoredJobs();
   }
 
@@ -323,6 +500,7 @@ class ApiClient {
    * GET /api/v1/jobs/{id}
    */
   async getJobById(id: string): Promise<DiscoveryJob | null> {
+    if (this.remote) return this.getOrNull(`/jobs/${encodeURIComponent(id)}`);
     const jobs = this.loadStoredJobs();
     return jobs.find((j) => j.id === id) || null;
   }
@@ -331,6 +509,14 @@ class ApiClient {
    * POST /api/v1/prospects/{id}/scrape
    */
   async scrapeProspectWebsite(prospectId: string): Promise<Prospect> {
+    if (this.remote) {
+      const path = `/prospects/${encodeURIComponent(prospectId)}`;
+      await this.request<ScrapeProspectResponse>('POST', `${path}/scrape`);
+      return this.poll(
+        () => this.request<Prospect>('GET', path),
+        (p) => p.scrapingStatus !== 'pending'
+      );
+    }
     const list = this.loadStoredProspects();
     const target = list.find((p) => p.id === prospectId);
     if (!target) throw new Error('Prospect not found');
@@ -380,6 +566,7 @@ class ApiClient {
    * GET /api/v1/settings
    */
   async getSettings(): Promise<AppSettings> {
+    if (this.remote) return this.request('GET', '/settings');
     return this.loadStoredSettings();
   }
 
@@ -387,6 +574,7 @@ class ApiClient {
    * PUT /api/v1/settings
    */
   async saveSettings(settings: AppSettings): Promise<AppSettings> {
+    if (this.remote) return this.request('PUT', '/settings', settings);
     this.saveStoredSettings(settings);
     return settings;
   }
@@ -395,25 +583,37 @@ class ApiClient {
    * GET /api/v1/activities
    */
   async getActivities(): Promise<ActivityItem[]> {
+    if (this.remote) return this.request('GET', '/activities?limit=50');
     return this.loadStoredActivities();
   }
 
   /**
-   * Healthcheck simulator for testing FastAPI backend connection
+   * GET <origin>/healthz of the backend (or of a URL typed into Settings).
    */
   async testBackendConnection(customUrl?: string): Promise<ApiHealthResponse> {
     const target = customUrl || this.baseUrl;
-    // Simulate real network latency check
     const start = performance.now();
-    await new Promise((r) => setTimeout(r, 450));
-    const latency = Math.round(performance.now() - start);
-
-    return {
-      status: 'healthy',
-      version: '1.1.0-fastapi-adapter',
-      latencyMs: latency,
-      environment: 'development-preview',
-    };
+    try {
+      const res = await fetch(`${new URL(target).origin}/healthz`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      const latencyMs = Math.round(performance.now() - start);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      return {
+        status: 'healthy',
+        version: body.version ?? 'unknown',
+        latencyMs,
+        environment: body.environment ?? 'unknown',
+      };
+    } catch {
+      return {
+        status: 'offline',
+        version: '',
+        latencyMs: Math.round(performance.now() - start),
+        environment: '',
+      };
+    }
   }
 
   /**
@@ -569,6 +769,13 @@ class ApiClient {
         fundingStage: resolvedFunding,
         techStack: resolvedTech,
         hiringRolesCount: template.hiringRolesCount,
+        ...(status === 'scraped' && {
+          publicEmail: `contact@${template.domain}`,
+          phone: '+1 (555) 019-8200',
+          linkedinUrl: `https://linkedin.com/company/${template.name.toLowerCase().replace(/[^a-z0-9]/g, '-')}`,
+          contactPageUrl: `https://${template.domain}/contact`,
+          careersPageUrl: `https://${template.domain}/careers`,
+        }),
       });
     }
 

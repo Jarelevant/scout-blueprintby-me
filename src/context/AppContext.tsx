@@ -210,7 +210,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       const actList = await apiClient.getActivities();
       setActivities(actList);
-      addToast(`Successfully scraped company data for ${updated.companyName}`, 'success');
+      if (updated.scrapingStatus === 'failed') {
+        const reason = updated.scrapingHistory[0]?.errorReason;
+        addToast(`Could not scrape ${updated.companyName}${reason ? `: ${reason}` : ''}`, 'error');
+      } else {
+        addToast(`Successfully scraped company data for ${updated.companyName}`, 'success');
+      }
     } catch {
       addToast('Website scraping failed to complete', 'error');
     }
@@ -230,38 +235,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         website: result.website,
         industry: result.industry,
         location: result.location,
-        publicEmail: `contact@${result.website.replace('https://', '').replace('http://', '').replace(/\/.*$/, '')}`,
-        phone: '+1 (555) 019-8200',
-        linkedinUrl: `https://linkedin.com/company/${result.companyName.toLowerCase().replace(/[^a-z0-9]/g, '-')}`,
-        contactPageUrl: `${result.website}/contact`,
-        careersPageUrl: `${result.website}/careers`,
+        // Only what discovery actually found: never invent contact data that gets saved as fact.
+        publicEmail: result.publicEmail ?? '',
+        phone: result.phone ?? '',
+        linkedinUrl: result.linkedinUrl ?? '',
+        contactPageUrl: result.contactPageUrl ?? '',
+        careersPageUrl: result.careersPageUrl ?? '',
         description: result.summary,
         scrapingStatus: result.status,
         discoveredDate: new Date().toISOString(),
         lastUpdated: new Date().toISOString(),
         verified: {
-          email: result.status === 'scraped',
-          phone: false,
-          website: true,
-          linkedin: true,
+          email: Boolean(result.publicEmail),
+          phone: Boolean(result.phone),
+          website: result.status === 'scraped',
+          linkedin: Boolean(result.linkedinUrl),
         },
-        discoveredJobListings: [
-          { title: 'Software Engineer', department: 'Engineering', location: result.location }
-        ],
+        discoveredJobListings: [],
         sourceUrls: [`Discovery Source: ${result.source}`],
-        scrapingHistory: [
-          {
-            id: `sh-${Date.now()}`,
-            timestamp: new Date().toISOString(),
-            status: result.status,
-            pagesScanned: 5,
-            durationMs: 1100,
-          }
-        ],
-        employeeRange: result.employeeRange || '20-50 employees',
-        fundingStage: result.fundingStage || 'Seed',
-        techStack: result.techStack || ['TypeScript', 'Cloud'],
-        hiringVelocity: (result.hiringRolesCount && result.hiringRolesCount > 2) ? 'Aggressive' : 'Moderate',
+        scrapingHistory: [],
+        employeeRange: result.employeeRange,
+        fundingStage: result.fundingStage,
+        techStack: result.techStack,
+        hiringVelocity:
+          result.hiringRolesCount === undefined
+            ? undefined
+            : result.hiringRolesCount > 2
+              ? 'Aggressive'
+              : result.hiringRolesCount > 0
+                ? 'Moderate'
+                : 'None',
       };
 
       await apiClient.saveProspect(newProspect);

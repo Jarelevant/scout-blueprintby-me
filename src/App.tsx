@@ -8,6 +8,7 @@ import { MyProspectsView } from './components/prospects/MyProspectsView';
 import { SettingsView } from './components/settings/SettingsView';
 import { ProspectDetailModal } from './components/prospects/ProspectDetailModal';
 import { ToastContainer } from './components/common/ToastContainer';
+import { AuthGate } from './components/auth/AuthGate';
 
 const MainLayout: React.FC = () => {
   const { currentTab, setCurrentTab, selectedProspect, setSelectedProspect } = useApp();
@@ -57,8 +58,10 @@ const MainLayout: React.FC = () => {
 
 export default function App() {
   return (
-    <AppProvider>
-      <MainLayout />
-    </AppProvider>
+    <AuthGate>
+      <AppProvider>
+        <MainLayout />
+      </AppProvider>
+    </AuthGate>
   );
 }
